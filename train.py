@@ -19,6 +19,7 @@ import glob
 import logging
 import os
 import random
+from contextlib import nullcontext
 from copy import deepcopy
 from time import time
 from typing import Any, Dict, Optional, Tuple
@@ -69,6 +70,11 @@ def train_step(
     ema: torch.nn.Module,
     device: torch.device,
     gradient_clip: float,
+    current_step: int = 0,
+    ema_decay: float = 0.9999,
+    zero_grad: bool = True,
+    optimizer_step: bool = True,
+    loss_scale: float = 1.0,
 ) -> Optional[Tuple[float, float, float]]:
     """Perform one forward–backward–optimiser step.
 
@@ -90,8 +96,12 @@ def train_step(
 
     # Time sampling is owned by the generative process. Flow Matching draws
     # t ~ U(0, 1) internally; no discrete DDPM timestep grid is used.
-    optimizer.zero_grad(set_to_none=True)
-    loss_dict = diffusion.training_losses(model, x)
+    if zero_grad:
+        optimizer.zero_grad(set_to_none=True)
+    if hasattr(diffusion, "_residual_weight_scale"):
+        loss_dict = diffusion.training_losses(model, x, step=current_step)
+    else:
+        loss_dict = diffusion.training_losses(model, x)
 
     if isinstance(loss_dict, dict) and "noise_loss" in loss_dict and "img_loss" in loss_dict:
         noise_loss = loss_dict["noise_loss"].mean()
@@ -103,14 +113,18 @@ def train_step(
 
     total_loss_val = total_loss.detach().float().item()
     if not torch.isfinite(total_loss) or total_loss_val > 1e5:
+        optimizer.zero_grad(set_to_none=True)
         return None
 
-    total_loss.backward()
+    (total_loss / loss_scale).backward()
+    if not optimizer_step:
+        return total_loss_val, noise_loss.detach().float().item(), img_loss.detach().float().item()
+
     torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
     optimizer.step()
 
     model_module = model.module if hasattr(model, "module") else model
-    update_ema(ema, model_module)
+    update_ema(ema, model_module, decay=ema_decay)
     return total_loss_val, noise_loss.detach().float().item(), img_loss.detach().float().item()
 
 
@@ -549,6 +563,13 @@ class Trainer:
             )
 
         train_steps = 0
+        micro_steps = 0
+        accumulation_steps = int(
+            getattr(self.config.training, "gradient_accumulation_steps", 1)
+        )
+        if accumulation_steps < 1:
+            raise ValueError("gradient_accumulation_steps must be at least one")
+        pending_loss = pending_noise = pending_img = 0.0
         log_steps   = 0
         running_loss = running_noise_loss = running_img_loss = 0.0
         start_time   = time()
@@ -564,22 +585,48 @@ class Trainer:
                     if train_steps >= total_steps_target:
                         break
 
-                    result = train_step(
-                        self.model,
-                        self.diffusion,
-                        batch["image"].to(self.device, non_blocking=True),
-                        self.optimizer,
-                        self.ema,
-                        self.device,
-                        gradient_clip,
+                    starts_accumulation = micro_steps % accumulation_steps == 0
+                    finishes_accumulation = (micro_steps + 1) % accumulation_steps == 0
+                    sync_context = (
+                        nullcontext()
+                        if finishes_accumulation or not hasattr(self.model, "no_sync")
+                        else self.model.no_sync()
                     )
+                    with sync_context:
+                        result = train_step(
+                            self.model,
+                            self.diffusion,
+                            batch["image"].to(self.device, non_blocking=True),
+                            self.optimizer,
+                            self.ema,
+                            self.device,
+                            gradient_clip,
+                            current_step=train_steps,
+                            ema_decay=float(getattr(self.config.training, "ema", 0.9999)),
+                            zero_grad=starts_accumulation,
+                            optimizer_step=finishes_accumulation,
+                            loss_scale=float(accumulation_steps),
+                        )
 
                     if result is None:
+                        micro_steps = 0
+                        pending_loss = pending_noise = pending_img = 0.0
                         if self.rank == 0:
                             self.logger.warning("Skipping step: invalid loss.")
                         continue
 
                     total_loss, noise_loss, img_loss = result
+                    pending_loss += total_loss
+                    pending_noise += noise_loss
+                    pending_img += img_loss
+                    micro_steps += 1
+                    if not finishes_accumulation:
+                        continue
+
+                    total_loss = pending_loss / accumulation_steps
+                    noise_loss = pending_noise / accumulation_steps
+                    img_loss = pending_img / accumulation_steps
+                    pending_loss = pending_noise = pending_img = 0.0
                     running_loss       += total_loss
                     running_noise_loss += noise_loss
                     running_img_loss   += img_loss
@@ -725,7 +772,9 @@ def main(config: Config, debug: bool = False, from_scratch: bool = False) -> Non
     torch.manual_seed(seed)
     torch.cuda.set_device(device)
 
-    config.model.from_scratch = from_scratch
+    config.model.from_scratch = bool(
+        from_scratch or getattr(config.model, "from_scratch", False)
+    )
     Trainer(config, rank, device, seed, debug=debug).train()
 
 

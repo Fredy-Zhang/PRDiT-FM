@@ -14,6 +14,7 @@ Naming convention:
 
 from __future__ import annotations
 
+from models.highres_hourglass_flow import HR512HourglassFlow
 from models.models import PRDiT
 
 
@@ -159,6 +160,25 @@ def load_model(config):
         If ``config.model.name`` is not registered.
     """
     model_name = config.model.name
+    if model_name == "HR512HourglassFlow":
+        hourglass_keys = (
+            "channels_256", "channels_128", "transformer_hidden_size",
+            "transformer_depth", "transformer_heads", "bottleneck_patch_size",
+            "skip_channels_256", "skip_channels_512", "local_hidden_channels",
+            "mlp_ratio", "gradient_checkpointing", "feature_checkpointing",
+        )
+        kwargs = {
+            key: getattr(config.model, key)
+            for key in hourglass_keys
+            if hasattr(config.model, key)
+        }
+        return HR512HourglassFlow(
+            input_size=config.data.image_size,
+            in_channels=config.model.in_channels,
+            out_channels=config.model.out_channels,
+            **kwargs,
+        )
+
     if model_name not in PRDiT_models:
         raise ValueError(f"Model name {model_name} is not recognized.")
 

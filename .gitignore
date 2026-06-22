@@ -1,1 +1,4 @@
 evaluations/pretrained/resnet_50_23dataset.pth
+__pycache__/
+*.py[cod]
+.pytest_cache/

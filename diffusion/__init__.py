@@ -45,9 +45,20 @@ def loading_diffusion(config, rank: int = 0):
 
     if out_channels == 1:
         num_steps = int(getattr(config.model, "num_sampling_steps", 100))
+        flow_config = getattr(config, "flow_matching", None)
+        flow_kwargs = {}
+        for key in (
+            "lambda_local", "lambda_128", "lambda_256", "lambda_512",
+            "lambda_full", "residual_warmup_steps",
+            "residual_warmup_start_steps", "residual_warmup_initial_weight",
+        ):
+            if flow_config is not None and hasattr(flow_config, key):
+                flow_kwargs[key] = getattr(flow_config, key)
+        precision = str(getattr(config.training, "precision", "fp32")).lower()
+        flow_kwargs["use_bf16"] = precision == "bf16"
         if rank == 0:
             print(f"Loading the FlowMatching process (velocity head, {num_steps} sampling steps)")
-        return FlowMatching(num_sampling_steps=num_steps, loss_type="l2")
+        return FlowMatching(num_sampling_steps=num_steps, loss_type="l2", **flow_kwargs)
 
     if out_channels == 2:
         if rank == 0:

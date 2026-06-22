@@ -1,0 +1,72 @@
+# Direct 512^3 Flow Matching from random initialization (4-GPU template).
+data:
+  image_size: 512
+  path: ""
+  train_list: "lidc_data/train.txt"
+  val_list: "lidc_data/val.txt"
+  task: "lidc"
+  num_workers: 4
+  val_frac: 0.1
+  augment: False
+  normalize: True
+
+model:
+  name: "HR512HourglassFlow"
+  in_channels: 1
+  out_channels: 1
+  num_classes: 1
+  num_sampling_steps: 100
+  from_scratch: True
+  pretrained_path: ""
+  checkpoint: ""
+  flash_attn: True
+  channels_256: 8
+  channels_128: 32
+  transformer_hidden_size: 768
+  transformer_depth: 4
+  transformer_heads: 12
+  bottleneck_patch_size: 8
+  local_hidden_channels: 2
+  skip_channels_256: 4
+  skip_channels_512: 1
+  gradient_checkpointing: True
+  feature_checkpointing: True
+
+flow_matching:
+  lambda_local: 1.0
+  lambda_128: 1.0
+  lambda_256: 1.0
+  lambda_512: 1.0
+  lambda_full: 1.0
+  residual_warmup_start_steps: 10000
+  residual_warmup_steps: 30000
+  residual_warmup_initial_weight: 0.1
+
+training:
+  # Global batch 4 gives one 512^3 volume/GPU on four GPUs.
+  batch_size: 4
+  gradient_accumulation_steps: 2
+  precision: "bf16"
+  learning_rate: 8e-5
+  total_steps: 130000
+  seed: 42
+  weight_decay: 0.0
+  gradient_clip: 1.0
+  ema: 0.999
+  num_gen_samples: 1
+
+output:
+  results_dir: "results_lidc_hr512"
+  checkpoint_dir: "checkpoints"
+
+logging:
+  log_every: 100
+  ckpt_every: 1000
+  eval_every: 1000
+
+wandb:
+  project: ""
+  entity: ""
+  tags: "hr512-hourglass-flow"
+  enable: False
+

@@ -63,6 +63,7 @@ def sample(args: argparse.Namespace) -> None:
     diffusion = FlowMatching(
         num_sampling_steps=args.num_sampling_steps,
         loss_type="l2",
+        use_bf16=str(getattr(config.training, "precision", "fp32")).lower() == "bf16",
     )
 
     # ── Sampling loop ─────────────────────────────────────────────────────────

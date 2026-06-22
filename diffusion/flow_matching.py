@@ -30,9 +30,10 @@ Notes
   solver. Report both ``num_steps`` and NFE (number of function evaluations).
 """
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Mapping, Optional, Tuple, Union
 
 import torch
+import torch.nn.functional as F
 
 
 class FlowMatching:
@@ -57,12 +58,30 @@ class FlowMatching:
         num_sampling_steps: int = 100,
         loss_type: str = "l2",
         embed_t_scale: float = 1000.0,
+        lambda_local: float = 1.0,
+        lambda_128: float = 1.0,
+        lambda_256: float = 1.0,
+        lambda_512: float = 1.0,
+        lambda_full: float = 1.0,
+        residual_warmup_steps: int = 0,
+        residual_warmup_start_steps: int = 10_000,
+        residual_warmup_initial_weight: float = 0.1,
+        use_bf16: bool = False,
     ):
         if loss_type != "l2":
             raise NotImplementedError(f"Loss type '{loss_type}' is not implemented.")
         self.num_sampling_steps = int(num_sampling_steps)
         self.loss_type = loss_type
         self.embed_t_scale = float(embed_t_scale)
+        self.lambda_local = float(lambda_local)
+        self.lambda_128 = float(lambda_128)
+        self.lambda_256 = float(lambda_256)
+        self.lambda_512 = float(lambda_512)
+        self.lambda_full = float(lambda_full)
+        self.residual_warmup_steps = int(residual_warmup_steps)
+        self.residual_warmup_start_steps = int(residual_warmup_start_steps)
+        self.residual_warmup_initial_weight = float(residual_warmup_initial_weight)
+        self.use_bf16 = bool(use_bf16)
 
     # -- Helpers --------------------------------------------------------------
 
@@ -74,6 +93,38 @@ class FlowMatching:
     def _model_t(self, t: torch.Tensor) -> torch.Tensor:
         """Map ``t in [0, 1]`` to the model's timestep-embedder input range."""
         return t * self.embed_t_scale
+
+    @staticmethod
+    def _velocity(output: Union[torch.Tensor, Mapping[str, torch.Tensor]]) -> torch.Tensor:
+        """Select the final velocity while preserving tensor-model support."""
+        if isinstance(output, Mapping):
+            if "velocity" not in output:
+                raise KeyError("Dictionary model output must contain a 'velocity' tensor")
+            return output["velocity"]
+        return output
+
+    @staticmethod
+    def _resize(x: torch.Tensor, spatial_shape: Tuple[int, int, int]) -> torch.Tensor:
+        return F.interpolate(x, size=spatial_shape, mode="trilinear", align_corners=False)
+
+    def _call_model(self, model, x: torch.Tensor, t: torch.Tensor, model_kwargs: Dict):
+        enabled = self.use_bf16 and x.device.type in {"cuda", "cpu"}
+        with torch.autocast(device_type=x.device.type, dtype=torch.bfloat16, enabled=enabled):
+            return model(x, self._model_t(t), **model_kwargs)
+
+    def _residual_weight_scale(self, step: Optional[int]) -> float:
+        """Return the configurable 256/512 curriculum multiplier."""
+        if self.residual_warmup_steps <= 0 or step is None:
+            return 1.0
+        start = min(self.residual_warmup_start_steps, self.residual_warmup_steps)
+        if step <= start:
+            return self.residual_warmup_initial_weight
+        if step >= self.residual_warmup_steps:
+            return 1.0
+        progress = (step - start) / max(self.residual_warmup_steps - start, 1)
+        return self.residual_warmup_initial_weight + progress * (
+            1.0 - self.residual_warmup_initial_weight
+        )
 
     def interpolate(
         self,
@@ -100,6 +151,7 @@ class FlowMatching:
         x_data: torch.Tensor,
         t: Optional[torch.Tensor] = None,
         model_kwargs: Optional[Dict] = None,
+        step: Optional[int] = None,
     ) -> Dict[str, torch.Tensor]:
         """Compute the per-sample velocity-matching loss.
 
@@ -133,11 +185,64 @@ class FlowMatching:
         x_noise = torch.randn_like(x_data)
         x_t, target_velocity = self.interpolate(x_data, x_noise, t)
 
-        v_pred = model(x_t, self._model_t(t), **model_kwargs)
+        output = self._call_model(model, x_t, t, model_kwargs)
 
         spatial_dims = list(range(1, x_data.ndim))
-        velocity_loss = (v_pred - target_velocity).pow(2).mean(dim=spatial_dims)
-        return {"loss": velocity_loss, "velocity_loss": velocity_loss}
+        if not isinstance(output, Mapping):
+            velocity_loss = (output - target_velocity).pow(2).mean(dim=spatial_dims)
+            return {"loss": velocity_loss, "velocity_loss": velocity_loss}
+
+        required = {
+            "velocity", "local_velocity", "global_velocity_128",
+            "global_residual_256", "global_residual_512",
+        }
+        missing = required.difference(output)
+        if missing:
+            raise KeyError(f"Dictionary model output is missing: {sorted(missing)}")
+
+        v_total = output["velocity"]
+        v_local = output["local_velocity"]
+        v_global_128 = output["global_velocity_128"]
+        delta_v_256 = output["global_residual_256"]
+        delta_v_512 = output["global_residual_512"]
+
+        # Detaching here is essential: pyramid losses must not update the local
+        # branch through the definition of their residual target.
+        global_target_512 = target_velocity - v_local.detach()
+        global_target_256 = self._resize(global_target_512, delta_v_256.shape[2:])
+        global_target_128 = self._resize(global_target_512, v_global_128.shape[2:])
+        delta_target_256 = global_target_256 - self._resize(
+            global_target_128, delta_v_256.shape[2:]
+        )
+        delta_target_512 = global_target_512 - self._resize(
+            global_target_256, delta_v_512.shape[2:]
+        )
+
+        loss_local = (v_local - target_velocity).pow(2).mean(dim=spatial_dims)
+        loss_global_128 = (v_global_128 - global_target_128).pow(2).mean(dim=spatial_dims)
+        loss_residual_256 = (delta_v_256 - delta_target_256).pow(2).mean(dim=spatial_dims)
+        loss_residual_512 = (delta_v_512 - delta_target_512).pow(2).mean(dim=spatial_dims)
+        loss_full = (v_total - target_velocity).pow(2).mean(dim=spatial_dims)
+
+        residual_scale = self._residual_weight_scale(step)
+        total = (
+            self.lambda_local * loss_local
+            + self.lambda_128 * loss_global_128
+            + residual_scale * self.lambda_256 * loss_residual_256
+            + residual_scale * self.lambda_512 * loss_residual_512
+            + self.lambda_full * loss_full
+        )
+        return {
+            "loss": total,
+            "velocity_loss": loss_full,
+            "loss/local": loss_local,
+            "loss/global_128": loss_global_128,
+            "loss/residual_256": loss_residual_256,
+            "loss/residual_512": loss_residual_512,
+            "loss/full": loss_full,
+            "loss/total": total,
+            "loss/residual_weight_scale": torch.full_like(total, residual_scale),
+        }
 
     # -- Reconstruction (used by depth-0 / coarse evaluation) -----------------
 
@@ -164,7 +269,7 @@ class FlowMatching:
         x_noise = torch.randn_like(x_data)
         x_t, _ = self.interpolate(x_data, x_noise, t)
 
-        v_pred = model(x_t, self._model_t(t), **model_kwargs)
+        v_pred = self._velocity(self._call_model(model, x_t, t, model_kwargs))
         x_data_hat = x_t + (1.0 - t_value) * v_pred
         return x_data_hat, x_t
 
@@ -236,7 +341,7 @@ class FlowMatching:
         for step in range(num_steps):
             t_scalar = step * dt
             t = torch.full((batch_size,), t_scalar, device=device, dtype=x.dtype)
-            v = model(x, self._model_t(t), **model_kwargs)
+            v = self._velocity(self._call_model(model, x, t, model_kwargs))
             nfe += 1
 
             if solver == "euler":
@@ -244,7 +349,7 @@ class FlowMatching:
             else:  # heun: predictor + endpoint-velocity corrector
                 x_pred = x + dt * v
                 t_next = torch.full((batch_size,), min((step + 1) * dt, 1.0), device=device, dtype=x.dtype)
-                v_next = model(x_pred, self._model_t(t_next), **model_kwargs)
+                v_next = self._velocity(self._call_model(model, x_pred, t_next, model_kwargs))
                 nfe += 1
                 x = x + dt * 0.5 * (v + v_next)
 
