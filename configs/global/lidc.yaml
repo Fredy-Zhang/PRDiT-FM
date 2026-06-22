@@ -1,0 +1,46 @@
+# LIDC global configuration
+# Config the image_size and dataroot path within Input parameters
+
+data:
+  image_size: 128  # Size of input images [64 | 128 | 256]
+  path: ""  # Root directory containing lidc_preprocessed/
+  train_list: "lidc_data/train.txt"
+  val_list: "lidc_data/val.txt"
+  task: "lidc"      # Public task alias used by the dataset factory
+  num_workers: 4    # Number of data loading workers
+  val_frac: 0.1     # Validation split ratio used when generating train.txt and val.txt
+  augment: False
+  normalize: True
+
+model:
+  name: "PRDiT-B/12/4"    # Model architecture name, B: 768, 12: patch size, 4: network depth
+  num_classes: 1        # Number of classes for conditional generation
+  in_channels: 1        # Number of input channels
+  out_channels: 1       # Velocity head: out_channels == in_channels (Flow Matching)
+  num_sampling_steps: 100  # Euler ODE steps used for generative evaluation
+  pretrained_path: "results_lidc/001-PRDiT-B-12-0/checkpoints/best_0.010829.pt"
+  checkpoint: ""
+  flash_attn: True
+
+training:
+  batch_size: 64           # Global batch size for training
+  learning_rate: 8e-5      # Learning rate for AdamW optimizer
+  total_steps: 130000       # Total gradient updates (replaces epochs — dataset-size-agnostic)
+  seed: 42                 # Random seed for reproducibility
+  weight_decay: 0.0        # Weight decay for optimizer
+  gradient_clip: 1.0
+
+output:
+  results_dir: "results_lidc"         # Directory for saving results
+  checkpoint_dir: "checkpoints"  # Directory for saving model checkpoints
+
+logging:
+  log_every: 400    # Log metrics every N steps
+  ckpt_every: 1000  # Save checkpoint every N steps
+  eval_every: 1000  # Evaluate model every N epochs
+
+wandb:
+  project: ""    # Optional W&B project name; keep empty in public templates
+  entity: ""     # Optional W&B entity/username
+  tags: ""
+  enable: False
